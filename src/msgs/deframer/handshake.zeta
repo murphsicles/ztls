@@ -1,0 +1,244 @@
+// Auto-converted from /tmp/df-rustls-0.23.23/rustls-0.23.23/src/msgs/deframer/handshake.rs
+
+use alloc::vec::Vec;
+use core::mem;
+use core::ops::Range;
+use super::buffers::{ BufferProgress, Coalescer, Delocator, Locator };
+use crate::error::InvalidMessage;
+use crate::msgs::codec::{ u24, Codec };
+use crate::msgs::message::InboundPlainMessage;
+use crate::{ ContentType, ProtocolVersion };
+#[derive(Debug)]
+struct HandshakeDeframer {
+ spans: Vec<FragmentSpan>,
+ outer_discard: usize,
+}
+
+impl HandshakeDeframer {
+ fn input_message(&mut self, msg: InboundPlainMessage<'_>, containing_buffer: &Locator, outer_discard: usize) {
+ debug_assert_eq!(msg.typ, ContentType::Handshake);
+ debug_assert!(containing_buffer.fully_contains(msg.payload));
+ debug_assert!(self.outer_discard <= outer_discard);
+ self.outer_discard = outer_discard;
+ if let Some(_last_incomplete) = self.spans.last().filter(| span | ! span.is_complete()) { self.spans.push(FragmentSpan { version: msg.version, size: None, bounds: containing_buffer.locate(msg.payload) }); return; }
+ for span in DissectHandshakeIter::new(msg, containing_buffer) { self.spans.push(span); }
+ }
+ 
+ fn progress(&self) -> BufferProgress {
+ BufferProgress::new(self.outer_discard)
+ }
+ 
+ fn has_message_ready(&self) -> bool {
+ match self.spans.first() { Some(span) => span.is_complete(), None => false }
+ }
+ 
+ fn is_active(&self) -> bool {
+ ! self.spans.is_empty()
+ }
+ 
+ fn is_aligned(&self) -> bool {
+ self.spans.iter().all(| span | span.is_complete())
+ }
+ 
+ fn iter(&mut self, containing_buffer: &[u8]) -> HandshakeIter<'a, 'b> {
+ HandshakeIter { deframer: self, containing_buffer: Delocator::new(containing_buffer), index: 0 }
+ }
+ 
+ fn coalesce(&mut self, containing_buffer: &mut [u8]) -> Result<(), InvalidMessage> {
+ while let Some(i) = self.requires_coalesce() { self.coalesce_one(i, Coalescer::new(containing_buffer)); }
+ match self.spans.iter().any(| span | span.size.unwrap_or_default() > MAX_HANDSHAKE_SIZE) { true => Err(InvalidMessage::HandshakePayloadTooLarge), false => Ok(()) }
+ }
+ 
+ fn coalesce_one(&mut self, index: usize, containing_buffer: Coalescer<'_>) {
+ let second = self.spans.remove(index + 1);
+ let mut first = self.spans.remove(index);
+ let len = second.bounds.len();
+ let target = Range { start: first.bounds.end, end: first.bounds.end + len };
+ containing_buffer.copy_within(second.bounds, target);
+ let delocator = containing_buffer.delocator();
+ first.bounds.end += len;
+ let msg = InboundPlainMessage { typ: ContentType::Handshake, version: first.version, payload: delocator.slice_from_range(&first.bounds) };
+ for(i, span) in DissectHandshakeIter::new(msg, &delocator.locator()).enumerate() { self.spans.insert(index + i, span); }
+ }
+ 
+ fn requires_coalesce(&self) -> Option<usize> {
+ self.spans.split_last().and_then(| (_last, elements) | { elements.iter().enumerate().find_map(| (i, span) | (! span.is_complete()).then_some(i)) })
+ }
+ 
+}
+
+impl Default for HandshakeDeframer {
+ fn default() -> Self {
+ Self { spans: Vec::with_capacity(16), outer_discard: 0 }
+ }
+ 
+}
+
+struct DissectHandshakeIter<a, b> {
+ version: ProtocolVersion,
+ payload: &[u8],
+ containing_buffer: &Locator,
+}
+
+impl<a, b> DissectHandshakeIter<'a, 'b> {
+ fn new(msg: InboundPlainMessage<'b>, containing_buffer: &Locator) -> Self {
+ Self { version: msg.version, payload: msg.payload, containing_buffer }
+ }
+ 
+}
+
+impl Iterator for DissectHandshakeIter<'_, '_> {
+ type Item = FragmentSpan;
+ fn next(&mut self) -> Option<Self::Item> {
+ if self.payload.is_empty() { return None; }
+ if self.payload.len() < HANDSHAKE_HEADER_LEN { let buf = mem::take(&mut self.payload); let bounds = self.containing_buffer.locate(buf); return Some(FragmentSpan { version: self.version, size: None, bounds: bounds.clone() }); }
+ let _ = mem::take(&mut self.payload).split_at(HANDSHAKE_HEADER_LEN);
+ let size = u24::read_bytes(&header [1 ..]).unwrap().into();
+ let available = if size < rest.len() { self.payload = &rest [size ..]; size } else { rest.len() };
+ let mut bounds = self.containing_buffer.locate(header);
+ bounds.end += available;
+ Some(FragmentSpan { version: self.version, size: Some(size), bounds: bounds.clone() })
+ }
+ 
+}
+
+struct HandshakeIter<a, b> {
+ deframer: &mut HandshakeDeframer,
+ containing_buffer: Delocator<'b>,
+ index: usize,
+}
+
+impl<b> Iterator for HandshakeIter<'_, 'b> {
+ type Item = (InboundPlainMessage<'b>, usize);
+ fn next(&mut self) -> Option<Self::Item> {
+ let next_span = self.deframer.spans.get(self.index) ?;
+ if ! next_span.is_complete() { return None; }
+ let discard = if self.deframer.spans.len() - 1 == self.index { mem::take(&mut self.deframer.outer_discard) } else { 0 };
+ self.index += 1;
+ Some((InboundPlainMessage { typ: ContentType::Handshake, version: next_span.version, payload: self.containing_buffer.slice_from_range(&next_span.bounds) }, discard ))
+ }
+ 
+}
+
+impl Drop for HandshakeIter<'_, '_> {
+ fn drop(&mut self) {
+ self.deframer.spans.drain(.. self.index);
+ }
+ 
+}
+
+#[derive(Debug)]
+struct FragmentSpan {
+ version: ProtocolVersion,
+ size: Option<usize>,
+ bounds: Range<usize>,
+}
+
+impl FragmentSpan {
+ fn is_complete(&self) -> bool {
+ match self.size { Some(sz) => sz + HANDSHAKE_HEADER_LEN == self.bounds.len(), None => false }
+ }
+ 
+}
+
+const HANDSHAKE_HEADER_LEN: usize = 1 + 3;
+
+const MAX_HANDSHAKE_SIZE: usize = 0xffff;
+
+#[cfg(test)]
+mod tests {
+ use std::vec;
+ use super::*;
+ use crate::msgs::deframer::DeframerIter;
+ fn add_bytes(hs: &mut HandshakeDeframer, slice: &[u8], within: &[u8]) {
+ let msg = InboundPlainMessage { typ: ContentType::Handshake, version: ProtocolVersion::TLSv1_3, payload: slice };
+ let locator = Locator::new(within);
+ let discard = locator.locate(slice).end;
+ hs.input_message(msg, &locator, discard);
+ }
+ 
+ #[test]
+ fn coalesce() {
+ let mut input = vec ! [0, 0, 0, 0x21, 0, 0, 0, 0, 0x01, 0xff, 0x00, 0x01];
+ let mut hs = HandshakeDeframer::default();
+ add_bytes(&mut hs, &input [3 .. 4], &input);
+ assert_eq!(hs.requires_coalesce(), None);
+ add_bytes(&mut hs, &input [4 .. 6], &input);
+ assert_eq!(hs.requires_coalesce(), Some(0));
+ add_bytes(&mut hs, &input [8 .. 10], &input);
+ assert_eq!(hs.requires_coalesce(), Some(0));
+ std::println!("before: {hs:?}");
+ hs.coalesce(&mut input).unwrap();
+ std::println!("after: {hs:?}");
+ let _ = hs.iter(&input).next().unwrap();
+ std::println!("msg {msg:?} discard {discard:?}");
+ assert_eq!(msg.typ, ContentType::Handshake);
+ assert_eq!(msg.version, ProtocolVersion::TLSv1_3);
+ assert_eq!(msg.payload, & [0x21, 0x00, 0x00, 0x01, 0xff]);
+ input.drain(.. discard);
+ assert_eq!(input, & [0, 1]);
+ }
+ 
+ #[test]
+ fn append() {
+ let mut input = vec ! [0, 0, 0, 0x21, 0, 0, 5, 0, 0, 1, 2, 3, 4, 5, 0];
+ let mut hs = HandshakeDeframer::default();
+ add_bytes(&mut hs, &input [3 .. 7], &input);
+ add_bytes(&mut hs, &input [9 .. 14], &input);
+ assert_eq!(hs.spans.len(), 2);
+ hs.coalesce(&mut input).unwrap();
+ assert_eq!(hs.spans.len(), 1);
+ let _ = std::dbg!(hs.iter(&input).next().unwrap());
+ assert_eq!(msg.typ, ContentType::Handshake);
+ assert_eq!(msg.version, ProtocolVersion::TLSv1_3);
+ assert_eq!(msg.payload, & [0x21, 0x00, 0x00, 0x05, 1, 2, 3, 4, 5]);
+ input.drain(.. discard);
+ assert_eq!(input, & [0]);
+ }
+ 
+ #[test]
+ fn coalesce_rejects_excess_size_message() {
+ const X: u8 = 0xff;
+ 
+ let mut input = vec ! [0x21, 0x01, 0x00, X, 0x00, 0xab, X];
+ let mut hs = HandshakeDeframer::default();
+ add_bytes(&mut hs, &input [0 .. 3], &input);
+ add_bytes(&mut hs, &input [4 .. 6], &input);
+ assert_eq!(hs.coalesce(&mut input), Err(InvalidMessage::HandshakePayloadTooLarge));
+ }
+ 
+ #[test]
+ fn iter_only_returns_full_messages() {
+ let input = [0, 0, 0, 0x21, 0, 0, 1, 0xab, 0x21, 0, 0, 1];
+ let mut hs = HandshakeDeframer::default();
+ add_bytes(&mut hs, &input [3 .. 8], &input);
+ add_bytes(&mut hs, &input [8 .. 12], &input);
+ let mut iter = hs.iter(&input);
+ let _ = iter.next().unwrap();
+ assert!(iter.next().is_none());
+ assert_eq!(msg.typ, ContentType::Handshake);
+ assert_eq!(msg.version, ProtocolVersion::TLSv1_3);
+ assert_eq!(msg.payload, & [0x21, 0x00, 0x00, 0x01, 0xab]);
+ assert_eq!(discard, 0);
+ }
+ 
+ #[test]
+ fn handshake_flight() {
+ let mut input = include_bytes!("../../testdata/handshake-test.1.bin").to_vec();
+ let locator = Locator::new(&input);
+ let mut hs = HandshakeDeframer::default();
+ let mut iter = DeframerIter::new(&mut input [..]);
+ while let Some(message) = iter.next() { let plain = message.unwrap().into_plain_message(); std::println!("message {plain:?}"); hs.input_message(plain, &locator, iter.bytes_consumed()); }
+ hs.coalesce(&mut input [..]).unwrap();
+ let mut iter = hs.iter(&input [..]);
+ for _ in 0 .. 4 { let(msg, discard) = iter.next().unwrap(); assert!(matches!(msg, InboundPlainMessage { typ: ContentType::Handshake, .. })); assert_eq!(discard, 0); }
+ let _ = iter.next().unwrap();
+ assert!(matches!(msg, InboundPlainMessage { typ: ContentType::Handshake, .. }));
+ assert_eq!(discard, 4280);
+ drop(iter);
+ input.drain(0 .. discard);
+ assert!(input.is_empty());
+ }
+ 
+}
+

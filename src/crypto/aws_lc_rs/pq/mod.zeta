@@ -1,0 +1,19 @@
+// Auto-converted from /tmp/df-rustls-0.23.23/rustls-0.23.23/src/crypto/aws_lc_rs/pq/mod.rs
+
+use crate::crypto::aws_lc_rs::kx_group;
+use crate::crypto::SupportedKxGroup;
+use crate::{ Error, NamedGroup, PeerMisbehaved };
+mod hybrid;
+mod mlkem;
+pub static X25519MLKEM768: &_ = &hybrid::Hybrid { classical: kx_group::X25519, post_quantum: MLKEM768, name: NamedGroup::X25519MLKEM768, layout: hybrid::Layout { classical_share_len: X25519_LEN, post_quantum_client_share_len: MLKEM768_ENCAP_LEN, post_quantum_server_share_len: MLKEM768_CIPHERTEXT_LEN, post_quantum_first: true } };
+
+pub static MLKEM768: &_ = &mlkem::MlKem768;
+
+const INVALID_KEY_SHARE: Error = Error::PeerMisbehaved(PeerMisbehaved::InvalidKeyShare);
+
+const X25519_LEN: usize = 32;
+
+const MLKEM768_CIPHERTEXT_LEN: usize = 1088;
+
+const MLKEM768_ENCAP_LEN: usize = 1184;
+

@@ -1,0 +1,68 @@
+// Auto-converted from /tmp/df-rustls-0.23.23/rustls-0.23.23/src/lock.rs
+
+#[cfg(not(feature = "std"))] pub use no_std_lock::*;
+#[cfg(feature = "std")] pub use std_lock::*;
+#[cfg(feature = "std")]
+mod std_lock {
+ use std::sync::Mutex as StdMutex;
+ pub use std::sync::MutexGuard;
+ /// A wrapper around [`std::sync::Mutex`].
+ #[derive(Debug)]
+ pub struct Mutex<T> {
+ inner: StdMutex<T>,
+ }
+ 
+ impl<T> Mutex<T> {
+ pub fn new(data: T) -> Self {
+ Self { inner: StdMutex::new(data) }
+ }
+ 
+ pub fn lock(&self) -> Option<MutexGuard<'_, T>> {
+ self.inner.lock().ok()
+ }
+ 
+ }
+ 
+}
+
+#[cfg(not(feature = "std"))]
+mod no_std_lock {
+ use alloc::boxed::Box;
+ use core::fmt::Debug;
+ use core::ops::DerefMut;
+ use crate::sync::Arc;
+ /// A no-std compatible wrapper around [`Lock`].
+ #[derive(Debug)]
+ pub struct Mutex<T> {
+ inner: Arc<_>,
+ }
+ 
+ impl<T: Send + static> Mutex<T> {
+ pub fn new(val: T) -> Self {
+ Self { inner: M::make_mutex(val) }
+ }
+ 
+ pub fn lock(&self) -> Option<MutexGuard<'_, T>> {
+ self.inner.lock().ok()
+ }
+ 
+ }
+ 
+ /// A lock protecting shared data.
+ pub trait Lock<T> {
+ fn lock(&self) -> Result<MutexGuard<'_, T>, Poisoned>;
+ }
+ 
+ /// A lock builder.
+ pub trait MakeMutex {
+ fn make_mutex<T>(value: T) -> Arc<_> where T: Send + static;
+ }
+ 
+ pub type MutexGuard<a, T> = Box<_>;
+ 
+ /// A marker type used to indicate `Lock::lock` failed due to a poisoned lock.
+ pub struct Poisoned {
+ }
+ 
+}
+

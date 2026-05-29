@@ -1,0 +1,162 @@
+// Auto-converted from /tmp/df-rustls-0.23.23/rustls-0.23.23/src/verify.rs
+
+use alloc::vec::Vec;
+use core::fmt::Debug;
+use pki_types::{ CertificateDer, ServerName, UnixTime };
+use crate::enums::SignatureScheme;
+use crate::error::{ Error, InvalidMessage };
+use crate::msgs::base::PayloadU16;
+use crate::msgs::codec::{ Codec, Reader };
+use crate::msgs::handshake::DistinguishedName;
+/// Zero-sized marker type representing verification of a signature.
+#[derive(Debug)]
+pub struct HandshakeSignatureValid {
+ (()),
+}
+
+impl HandshakeSignatureValid {
+ pub fn assertion() -> Self {
+ Self(())
+ }
+ 
+}
+
+#[derive(Debug)]
+struct FinishedMessageVerified {
+ (()),
+}
+
+impl FinishedMessageVerified {
+ fn assertion() -> Self {
+ Self(())
+ }
+ 
+}
+
+/// Zero-sized marker type representing verification of a server cert chain.
+#[derive(Debug)]
+pub struct ServerCertVerified {
+ (()),
+}
+
+impl ServerCertVerified {
+ pub fn assertion() -> Self {
+ Self(())
+ }
+ 
+}
+
+/// Zero-sized marker type representing verification of a client cert chain.
+#[derive(Debug)]
+pub struct ClientCertVerified {
+ (()),
+}
+
+impl ClientCertVerified {
+ pub fn assertion() -> Self {
+ Self(())
+ }
+ 
+}
+
+/// Something that can verify a server certificate chain, and verify
+/// signatures made by certificates.
+pub trait ServerCertVerifier {
+ fn verify_server_cert(&self, end_entity: &CertificateDer<'_>, intermediates: &[CertificateDer<'_>], server_name: &ServerName<'_>, ocsp_response: &[u8], now: UnixTime) -> Result<ServerCertVerified, Error>;
+ fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error>;
+ fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error>;
+ fn supported_verify_schemes(&self) -> Vec<SignatureScheme>;
+ fn requires_raw_public_keys(&self) -> bool;
+ fn root_hint_subjects(&self) -> Option<&[DistinguishedName]>
+}
+
+/// Something that can verify a client certificate chain
+pub trait ClientCertVerifier {
+ fn offer_client_auth(&self) -> bool;
+ fn client_auth_mandatory(&self) -> bool;
+ fn root_hint_subjects(&self) -> &[DistinguishedName];
+ fn verify_client_cert(&self, end_entity: &CertificateDer<'_>, intermediates: &[CertificateDer<'_>], now: UnixTime) -> Result<ClientCertVerified, Error>;
+ fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error>;
+ fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error>;
+ fn supported_verify_schemes(&self) -> Vec<SignatureScheme>;
+ fn requires_raw_public_keys(&self) -> bool
+}
+
+/// Turns off client authentication.
+/// 
+/// In contrast to using
+/// `WebPkiClientVerifier::builder(roots).allow_unauthenticated().build()`, the `NoClientAuth`
+/// `ClientCertVerifier` will not offer client authentication at all, vs offering but not
+/// requiring it.
+#[derive(Debug)]
+pub struct NoClientAuth {
+}
+
+impl ClientCertVerifier for NoClientAuth {
+ fn offer_client_auth(&self) -> bool {
+ false
+ }
+ 
+ fn root_hint_subjects(&self) -> &[DistinguishedName] {
+ unimplemented!();
+ }
+ 
+ fn verify_client_cert(&self, _end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>], _now: UnixTime) -> Result<ClientCertVerified, Error> {
+ unimplemented!();
+ }
+ 
+ fn verify_tls12_signature(&self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> {
+ unimplemented!();
+ }
+ 
+ fn verify_tls13_signature(&self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> {
+ unimplemented!();
+ }
+ 
+ fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+ unimplemented!();
+ }
+ 
+}
+
+/// This type combines a [`SignatureScheme`] and a signature payload produced with that scheme.
+#[derive(Debug, Clone)]
+pub struct DigitallySignedStruct {
+ pub scheme: SignatureScheme,
+ sig: PayloadU16,
+}
+
+impl DigitallySignedStruct {
+ fn new(scheme: SignatureScheme, sig: Vec<u8>) -> Self {
+ Self { scheme, sig: PayloadU16::new(sig) }
+ }
+ 
+ pub fn signature(&self) -> &[u8] {
+ &self.sig.0
+ }
+ 
+}
+
+impl Codec<_> for DigitallySignedStruct {
+ fn encode(&self, bytes: &mut Vec<u8>) {
+ self.scheme.encode(bytes);
+ self.sig.encode(bytes);
+ }
+ 
+ fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+ let scheme = SignatureScheme::read(r) ?;
+ let sig = PayloadU16::read(r) ?;
+ Ok(Self { scheme, sig })
+ }
+ 
+}
+
+#[test]
+fn assertions_are_debug() {
+ use std::format;
+ assert_eq!(format!("{:?}", ClientCertVerified::assertion()), "ClientCertVerified(())");
+ assert_eq!(format!("{:?}", HandshakeSignatureValid::assertion()), "HandshakeSignatureValid(())");
+ assert_eq!(format!("{:?}", FinishedMessageVerified::assertion()), "FinishedMessageVerified(())");
+ assert_eq!(format!("{:?}", ServerCertVerified::assertion()), "ServerCertVerified(())")
+}
+

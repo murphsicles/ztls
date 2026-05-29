@@ -1,0 +1,184 @@
+// Auto-converted from /tmp/df-rustls-0.23.23/rustls-0.23.23/src/record_layer.rs
+
+use alloc::boxed::Box;
+use core::cmp::min;
+use crate::crypto::cipher::{ InboundOpaqueMessage, MessageDecrypter, MessageEncrypter };
+use crate::error::Error;
+use crate::log::trace;
+use crate::msgs::message::{ InboundPlainMessage, OutboundOpaqueMessage, OutboundPlainMessage };
+#[derive(PartialEq)]
+enum DirectionState {
+ Invalid,
+ Prepared,
+ Active,
+}
+
+/// Record layer that tracks decryption and encryption keys.
+struct RecordLayer {
+ message_encrypter: Box<_>,
+ message_decrypter: Box<_>,
+ write_seq_max: u64,
+ write_seq: u64,
+ read_seq: u64,
+ has_decrypted: bool,
+ encrypt_state: DirectionState,
+ decrypt_state: DirectionState,
+ trial_decryption_len: Option<usize>,
+}
+
+impl RecordLayer {
+ fn new() -> Self {
+ Self { message_encrypter: < dyn MessageEncrypter >::invalid(), message_decrypter: < dyn MessageDecrypter >::invalid(), write_seq_max: 0, write_seq: 0, read_seq: 0, has_decrypted: false, encrypt_state: DirectionState::Invalid, decrypt_state: DirectionState::Invalid, trial_decryption_len: None }
+ }
+ 
+ fn decrypt_incoming(&mut self, encr: InboundOpaqueMessage<'a>) -> Result<Option<Decrypted<'a>>, Error> {
+ if self.decrypt_state != DirectionState::Active { return Ok(Some(Decrypted { want_close_before_decrypt: false, plaintext: encr.into_plain_message() })); }
+ let want_close_before_decrypt = self.read_seq == SEQ_SOFT_LIMIT;
+ let encrypted_len = encr.payload.len();
+ match self.message_decrypter.decrypt(encr, self.read_seq) { Ok(plaintext) => { self.read_seq += 1; if ! self.has_decrypted { self.has_decrypted = true; } Ok(Some(Decrypted { want_close_before_decrypt, plaintext })) } Err(Error::DecryptError) if self.doing_trial_decryption(encrypted_len) => { trace!("Dropping undecryptable message after aborted early_data"); Ok(None) } Err(err) => Err(err) }
+ }
+ 
+ fn encrypt_outgoing(&mut self, plain: OutboundPlainMessage<'_>) -> OutboundOpaqueMessage {
+ debug_assert!(self.encrypt_state == DirectionState::Active);
+ assert!(self.next_pre_encrypt_action() != PreEncryptAction::Refuse);
+ let seq = self.write_seq;
+ self.write_seq += 1;
+ self.message_encrypter.encrypt(plain, seq).unwrap()
+ }
+ 
+ fn prepare_message_encrypter(&mut self, cipher: Box<_>, max_messages: u64) {
+ self.message_encrypter = cipher;
+ self.write_seq = 0;
+ self.write_seq_max = min(SEQ_SOFT_LIMIT, max_messages);
+ self.encrypt_state = DirectionState::Prepared;
+ }
+ 
+ fn prepare_message_decrypter(&mut self, cipher: Box<_>) {
+ self.message_decrypter = cipher;
+ self.read_seq = 0;
+ self.decrypt_state = DirectionState::Prepared;
+ }
+ 
+ fn start_encrypting(&mut self) {
+ debug_assert!(self.encrypt_state == DirectionState::Prepared);
+ self.encrypt_state = DirectionState::Active;
+ }
+ 
+ fn start_decrypting(&mut self) {
+ debug_assert!(self.decrypt_state == DirectionState::Prepared);
+ self.decrypt_state = DirectionState::Active;
+ }
+ 
+ fn set_message_encrypter(&mut self, cipher: Box<_>, max_messages: u64) {
+ self.prepare_message_encrypter(cipher, max_messages);
+ self.start_encrypting();
+ }
+ 
+ fn set_message_decrypter(&mut self, cipher: Box<_>) {
+ self.prepare_message_decrypter(cipher);
+ self.start_decrypting();
+ self.trial_decryption_len = None;
+ }
+ 
+ fn set_message_decrypter_with_trial_decryption(&mut self, cipher: Box<_>, max_length: usize) {
+ self.prepare_message_decrypter(cipher);
+ self.start_decrypting();
+ self.trial_decryption_len = Some(max_length);
+ }
+ 
+ fn finish_trial_decryption(&mut self) {
+ self.trial_decryption_len = None;
+ }
+ 
+ fn next_pre_encrypt_action(&self) -> PreEncryptAction {
+ self.pre_encrypt_action(0)
+ }
+ 
+ fn pre_encrypt_action(&self, add: u64) -> PreEncryptAction {
+ match self.write_seq.saturating_add(add) { v if v == self.write_seq_max => PreEncryptAction::RefreshOrClose, SEQ_HARD_LIMIT .. => PreEncryptAction::Refuse, _ => PreEncryptAction::Nothing }
+ }
+ 
+ fn is_encrypting(&self) -> bool {
+ self.encrypt_state == DirectionState::Active
+ }
+ 
+ fn has_decrypted(&self) -> bool {
+ self.has_decrypted
+ }
+ 
+ fn write_seq(&self) -> u64 {
+ self.write_seq
+ }
+ 
+ fn read_seq(&self) -> u64 {
+ self.read_seq
+ }
+ 
+ fn encrypted_len(&self, payload_len: usize) -> usize {
+ self.message_encrypter.encrypted_payload_len(payload_len)
+ }
+ 
+ fn doing_trial_decryption(&mut self, requested: usize) -> bool {
+ match self.trial_decryption_len.and_then(| value | value.checked_sub(requested)) { Some(remaining) => { self.trial_decryption_len = Some(remaining); true } _ => false }
+ }
+ 
+}
+
+/// Result of decryption.
+#[derive(Debug)]
+struct Decrypted<a> {
+ want_close_before_decrypt: bool,
+ plaintext: InboundPlainMessage<'a>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PreEncryptAction {
+ Nothing,
+ RefreshOrClose,
+ Refuse,
+}
+
+const SEQ_SOFT_LIMIT: u64 = 0xffff_ffff_ffff_0000u64;
+
+const SEQ_HARD_LIMIT: u64 = 0xffff_ffff_ffff_fffeu64;
+
+#[cfg(test)]
+mod tests {
+ use super::*;
+ #[test]
+ fn test_has_decrypted() {
+ use crate::{ ContentType, ProtocolVersion };
+ struct PassThroughDecrypter {
+ }
+ 
+ impl MessageDecrypter for PassThroughDecrypter {
+ fn decrypt(&mut self, m: InboundOpaqueMessage<'a>, _: u64) -> Result<InboundPlainMessage<'a>, Error> {
+ Ok(m.into_plain_message())
+ }
+ 
+ }
+ 
+ let mut record_layer = RecordLayer::new();
+ assert!(matches!(record_layer.decrypt_state, DirectionState::Invalid));
+ assert_eq!(record_layer.read_seq, 0);
+ assert!(! record_layer.has_decrypted());
+ record_layer.prepare_message_decrypter(Box::new(PassThroughDecrypter));
+ assert!(matches!(record_layer.decrypt_state, DirectionState::Prepared));
+ assert_eq!(record_layer.read_seq, 0);
+ assert!(! record_layer.has_decrypted());
+ record_layer.start_decrypting();
+ assert!(matches!(record_layer.decrypt_state, DirectionState::Active));
+ assert_eq!(record_layer.read_seq, 0);
+ assert!(! record_layer.has_decrypted());
+ record_layer.decrypt_incoming(InboundOpaqueMessage::new(ContentType::Handshake, ProtocolVersion::TLSv1_2, &mut [0xC0, 0xFF, 0xEE] )).unwrap();
+ assert!(matches!(record_layer.decrypt_state, DirectionState::Active));
+ assert_eq!(record_layer.read_seq, 1);
+ assert!(record_layer.has_decrypted());
+ record_layer.set_message_decrypter(Box::new(PassThroughDecrypter));
+ assert!(matches!(record_layer.decrypt_state, DirectionState::Active));
+ assert_eq!(record_layer.read_seq, 0);
+ assert!(record_layer.has_decrypted());
+ }
+ 
+}
+

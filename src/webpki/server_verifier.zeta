@@ -1,0 +1,193 @@
+// Auto-converted from /tmp/df-rustls-0.23.23/rustls-0.23.23/src/webpki/server_verifier.rs
+
+use alloc::vec::Vec;
+use pki_types::{ CertificateDer, CertificateRevocationListDer, ServerName, UnixTime };
+use webpki::{ CertRevocationList, ExpirationPolicy, RevocationCheckDepth, UnknownStatusPolicy };
+use crate::crypto::{ CryptoProvider, WebPkiSupportedAlgorithms };
+use crate::log::trace;
+use crate::sync::Arc;
+use crate::verify::{ DigitallySignedStruct, HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier };
+use crate::webpki::verify::{ verify_server_cert_signed_by_trust_anchor_impl, verify_tls12_signature, verify_tls13_signature, ParsedCertificate };
+use crate::webpki::{ parse_crls, verify_server_name, VerifierBuilderError };
+#[cfg(doc)] use crate::{ crypto, ConfigBuilder, ServerConfig };
+use crate::{ Error, RootCertStore, SignatureScheme };
+/// A builder for configuring a `webpki` server certificate verifier.
+/// 
+/// For more information, see the [`WebPkiServerVerifier`] documentation.
+#[derive(Debug, Clone)]
+pub struct ServerCertVerifierBuilder {
+ roots: Arc<RootCertStore>,
+ crls: Vec<CertificateRevocationListDer<'static>>,
+ revocation_check_depth: RevocationCheckDepth,
+ unknown_revocation_policy: UnknownStatusPolicy,
+ revocation_expiration_policy: ExpirationPolicy,
+ supported_algs: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifierBuilder {
+ fn new(roots: Arc<RootCertStore>, supported_algs: WebPkiSupportedAlgorithms) -> Self {
+ Self { roots, crls: Vec::new(), revocation_check_depth: RevocationCheckDepth::Chain, unknown_revocation_policy: UnknownStatusPolicy::Deny, revocation_expiration_policy: ExpirationPolicy::Ignore, supported_algs }
+ }
+ 
+ pub fn with_crls(self, crls: impl IntoIterator<_>) -> Self {
+ self.crls.extend(crls);
+ self
+ }
+ 
+ pub fn only_check_end_entity_revocation(self) -> Self {
+ self.revocation_check_depth = RevocationCheckDepth::EndEntity;
+ self
+ }
+ 
+ pub fn allow_unknown_revocation_status(self) -> Self {
+ self.unknown_revocation_policy = UnknownStatusPolicy::Allow;
+ self
+ }
+ 
+ pub fn enforce_revocation_expiration(self) -> Self {
+ self.revocation_expiration_policy = ExpirationPolicy::Enforce;
+ self
+ }
+ 
+ pub fn build(self) -> Result<Arc<WebPkiServerVerifier>, VerifierBuilderError> {
+ if self.roots.is_empty() { return Err(VerifierBuilderError::NoRootAnchors); }
+ Ok(WebPkiServerVerifier::new(self.roots, parse_crls(self.crls) ?, self.revocation_check_depth, self.unknown_revocation_policy, self.revocation_expiration_policy, self.supported_algs ).into())
+ }
+ 
+}
+
+/// Default `ServerCertVerifier`, see the trait impl for more information.
+#[derive(Debug)]
+pub struct WebPkiServerVerifier {
+ roots: Arc<RootCertStore>,
+ crls: Vec<CertRevocationList<'static>>,
+ revocation_check_depth: RevocationCheckDepth,
+ unknown_revocation_policy: UnknownStatusPolicy,
+ revocation_expiration_policy: ExpirationPolicy,
+ supported: WebPkiSupportedAlgorithms,
+}
+
+impl WebPkiServerVerifier {
+ pub fn builder(roots: Arc<RootCertStore>) -> ServerCertVerifierBuilder {
+ Self::builder_with_provider(roots, Arc::clone(CryptoProvider::get_default_or_install_from_crate_features()) )
+ }
+ 
+ pub fn builder_with_provider(roots: Arc<RootCertStore>, provider: Arc<CryptoProvider>) -> ServerCertVerifierBuilder {
+ ServerCertVerifierBuilder::new(roots, provider.signature_verification_algorithms)
+ }
+ 
+ fn new_without_revocation(roots: impl Into<Arc<RootCertStore>>, supported_algs: WebPkiSupportedAlgorithms) -> Self {
+ Self::new(roots, Vec::default(), RevocationCheckDepth::Chain, UnknownStatusPolicy::Allow, ExpirationPolicy::Ignore, supported_algs )
+ }
+ 
+ fn new(roots: impl Into<Arc<RootCertStore>>, crls: Vec<CertRevocationList<'static>>, revocation_check_depth: RevocationCheckDepth, unknown_revocation_policy: UnknownStatusPolicy, revocation_expiration_policy: ExpirationPolicy, supported: WebPkiSupportedAlgorithms) -> Self {
+ Self { roots: roots.into(), crls, revocation_check_depth, unknown_revocation_policy, revocation_expiration_policy, supported }
+ }
+ 
+}
+
+impl ServerCertVerifier for WebPkiServerVerifier {
+ fn verify_server_cert(&self, end_entity: &CertificateDer<'_>, intermediates: &[CertificateDer<'_>], server_name: &ServerName<'_>, ocsp_response: &[u8], now: UnixTime) -> Result<ServerCertVerified, Error> {
+ let cert = ParsedCertificate::try_from(end_entity) ?;
+ let crl_refs = self.crls.iter().collect::<Vec<_> >();
+ let revocation = if self.crls.is_empty() { None } else { Some(webpki::RevocationOptionsBuilder::new(crl_refs.as_slice()).unwrap().with_depth(self.revocation_check_depth).with_status_policy(self.unknown_revocation_policy).with_expiration_policy(self.revocation_expiration_policy).build() ) };
+ verify_server_cert_signed_by_trust_anchor_impl(&cert, &self.roots, intermediates, revocation, now, self.supported.all ) ?;
+ if ! ocsp_response.is_empty() { trace!("Unvalidated OCSP response: {:?}", ocsp_response.to_vec()); }
+ verify_server_name(&cert, server_name) ?;
+ Ok(ServerCertVerified::assertion())
+ }
+ 
+ fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> {
+ verify_tls12_signature(message, cert, dss, &self.supported)
+ }
+ 
+ fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, Error> {
+ verify_tls13_signature(message, cert, dss, &self.supported)
+ }
+ 
+ fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+ self.supported.supported_schemes()
+ }
+ 
+}
+
+#[cfg(test)]
+#[macro_rules_attribute::apply(test_for_each_provider)]
+mod tests {
+ use std::prelude::v1::*;
+ use std::{ println, vec };
+ use pki_types::pem::PemObject;
+ use pki_types::{ CertificateDer, CertificateRevocationListDer };
+ use super::{ provider, VerifierBuilderError, WebPkiServerVerifier };
+ use crate::sync::Arc;
+ use crate::RootCertStore;
+ fn load_crls(crls_der: &[&[u8]]) -> Vec<CertificateRevocationListDer<'static>> {
+ crls_der.iter().map(| pem_bytes | CertificateRevocationListDer::from_pem_slice(pem_bytes).unwrap()).collect()
+ }
+ 
+ fn test_crls() -> Vec<CertificateRevocationListDer<'static>> {
+ load_crls(& [include_bytes!("../../../test-ca/ecdsa-p256/client.revoked.crl.pem").as_slice(), include_bytes!("../../../test-ca/rsa-2048/client.revoked.crl.pem").as_slice() ,])
+ }
+ 
+ fn load_roots(roots_der: &[&[u8]]) -> Arc<RootCertStore> {
+ let mut roots = RootCertStore::empty();
+ roots_der.iter().for_each(| der | { roots.add(CertificateDer::from(der.to_vec())).unwrap() });
+ roots.into()
+ }
+ 
+ fn test_roots() -> Arc<RootCertStore> {
+ load_roots(& [include_bytes!("../../../test-ca/ecdsa-p256/ca.der").as_slice(), include_bytes!("../../../test-ca/rsa-2048/ca.der").as_slice() ,])
+ }
+ 
+ #[test]
+ fn test_with_invalid_crls() {
+ let result = WebPkiServerVerifier::builder_with_provider(test_roots(), provider::default_provider().into() ).with_crls(vec ! [CertificateRevocationListDer::from(vec ! [0xFF])]).build();
+ assert!(matches!(result, Err(VerifierBuilderError::InvalidCrl(_))));
+ }
+ 
+ #[test]
+ fn test_with_crls_multiple_calls() {
+ let initial_crls = test_crls();
+ let extra_crls = load_crls(& [include_bytes!("../../../test-ca/eddsa/client.revoked.crl.pem").as_slice() ,]);
+ let builder = WebPkiServerVerifier::builder_with_provider(test_roots(), provider::default_provider().into() ).with_crls(initial_crls.clone()).with_crls(extra_crls.clone());
+ assert_eq!(builder.crls.len(), initial_crls.len() + extra_crls.len());
+ println!("{:?}", builder);
+ builder.build().unwrap();
+ }
+ 
+ #[test]
+ fn test_builder_no_roots() {
+ let result = WebPkiServerVerifier::builder_with_provider(RootCertStore::empty().into(), provider::default_provider().into() ).build();
+ assert!(matches!(result, Err(VerifierBuilderError::NoRootAnchors)));
+ }
+ 
+ #[test]
+ fn test_server_verifier_ee_only() {
+ let builder = WebPkiServerVerifier::builder_with_provider(test_roots(), provider::default_provider().into() ).only_check_end_entity_revocation();
+ println!("{:?}", builder);
+ builder.build().unwrap();
+ }
+ 
+ #[test]
+ fn test_server_verifier_allow_unknown() {
+ let builder = WebPkiServerVerifier::builder_with_provider(test_roots(), provider::default_provider().into() ).allow_unknown_revocation_status();
+ println!("{:?}", builder);
+ builder.build().unwrap();
+ }
+ 
+ #[test]
+ fn test_server_verifier_allow_unknown_ee_only() {
+ let builder = WebPkiServerVerifier::builder_with_provider(test_roots(), provider::default_provider().into() ).allow_unknown_revocation_status().only_check_end_entity_revocation();
+ println!("{:?}", builder);
+ builder.build().unwrap();
+ }
+ 
+ #[test]
+ fn test_server_verifier_enforce_expiration() {
+ let builder = WebPkiServerVerifier::builder_with_provider(test_roots(), provider::default_provider().into() ).enforce_revocation_expiration();
+ println!("{:?}", builder);
+ builder.build().unwrap();
+ }
+ 
+}
+

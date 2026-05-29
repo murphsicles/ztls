@@ -1,0 +1,7 @@
+// Auto-converted from /tmp/df-rustls-0.23.23/rustls-0.23.23/src/polyfill.rs
+
+/// Non-panicking `let(nonce, ciphertext) = ciphertext.split_at(...)`.
+fn try_split_at(slice: &[u8], mid: usize) -> Option<(&[u8], &[u8])> {
+ match mid > slice.len() { true => None, false => Some(slice.split_at(mid)) }
+}
+

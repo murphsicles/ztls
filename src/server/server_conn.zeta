@@ -1,0 +1,652 @@
+// Auto-converted from /tmp/df-rustls-0.23.23/rustls-0.23.23/src/server/server_conn.rs
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::fmt;
+use core::fmt::{ Debug, Formatter };
+use core::marker::PhantomData;
+use core::ops::{ Deref, DerefMut };
+#[cfg(feature = "std")] use std::io;
+use pki_types::{ DnsName, UnixTime };
+use super::hs;
+use crate::builder::ConfigBuilder;
+use crate::common_state::{ CommonState, Side };
+#[cfg(feature = "std")] use crate::common_state::{ Protocol, State };
+use crate::conn::{ ConnectionCommon, ConnectionCore, UnbufferedConnectionCommon };
+#[cfg(doc)] use crate::crypto;
+use crate::crypto::CryptoProvider;
+use crate::enums::{ CipherSuite, ProtocolVersion, SignatureScheme };
+use crate::error::Error;
+use crate::log::trace;
+use crate::msgs::base::Payload;
+use crate::msgs::enums::CertificateType;
+use crate::msgs::handshake::{ ClientHelloPayload, ProtocolName, ServerExtension };
+use crate::msgs::message::Message;
+use crate::sync::Arc;
+#[cfg(feature = "std")] use crate::time_provider::DefaultTimeProvider;
+use crate::time_provider::TimeProvider;
+use crate::vecbuf::ChunkVecBuffer;
+#[cfg(feature = "std")] use crate::WantsVerifier;
+use crate::{ compress, sign, verify, versions, DistinguishedName, KeyLog, WantsVersions };
+/// A trait for the ability to store server session data.
+/// 
+/// The keys and values are opaque.
+/// 
+/// Inserted keys are randomly chosen by the library and have
+/// no internal structure(in other words, you may rely on all
+/// bits being uniformly random). Queried keys are untrusted data.
+/// 
+/// Both the keys and values should be treated as
+/// **highly sensitive data**, containing enough key material
+/// to break all security of the corresponding sessions.
+/// 
+/// Implementations can be lossy(in other words, forgetting
+/// key/value pairs) without any negative security consequences.
+/// 
+/// However, note that `take` **must**reliably delete a returned
+/// value. If it does not, there may be security consequences.
+/// 
+/// `put` and `take` are mutating operations; this isn't expressed
+/// in the type system to allow implementations freedom in
+/// how to achieve interior mutability. `Mutex` is a common
+/// choice.
+pub trait StoresServerSessions {
+ fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool;
+ fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
+ fn take(&self, key: &[u8]) -> Option<Vec<u8>>;
+ fn can_cache(&self) -> bool
+}
+
+/// A trait for the ability to encrypt and decrypt tickets.
+pub trait ProducesTickets {
+ fn enabled(&self) -> bool;
+ fn lifetime(&self) -> u32;
+ fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>>;
+ fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>>
+}
+
+/// How to choose a certificate chain and signing key for use
+/// in server authentication.
+/// 
+/// This is suitable when selecting a certificate does not require
+/// I/O or when the application is using blocking I/O anyhow.
+/// 
+/// For applications that use async I/O and need to do I/O to choose
+/// a certificate(for instance, fetching a certificate from a data store),
+/// the [`Acceptor`] interface is more suitable.
+pub trait ResolvesServerCert {
+ fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<sign::CertifiedKey>>;
+ fn only_raw_public_keys(&self) -> bool
+}
+
+/// A struct representing the received Client Hello
+#[derive(Debug)]
+pub struct ClientHello<a> {
+ server_name: &Option<DnsName<'a>>,
+ signature_schemes: &[SignatureScheme],
+ alpn: Option<&Vec<ProtocolName>>,
+ server_cert_types: Option<&[CertificateType]>,
+ client_cert_types: Option<&[CertificateType]>,
+ cipher_suites: &[CipherSuite],
+ certificate_authorities: Option<&[DistinguishedName]>,
+}
+
+impl<a> ClientHello<'a> {
+ pub fn server_name(&self) -> Option<&str> {
+ self.server_name.as_ref().map(< DnsName<'_> as AsRef<str> >::as_ref)
+ }
+ 
+ pub fn signature_schemes(&self) -> &[SignatureScheme] {
+ self.signature_schemes
+ }
+ 
+ pub fn alpn(&self) -> Option<impl Iterator<_>> {
+ self.alpn.map(| protocols | { protocols.iter().map(| proto | proto.as_ref()) })
+ }
+ 
+ pub fn cipher_suites(&self) -> &[CipherSuite] {
+ self.cipher_suites
+ }
+ 
+ pub fn server_cert_types(&self) -> Option<&[CertificateType]> {
+ self.server_cert_types
+ }
+ 
+ pub fn client_cert_types(&self) -> Option<&[CertificateType]> {
+ self.client_cert_types
+ }
+ 
+ pub fn certificate_authorities(&self) -> Option<&[DistinguishedName]> {
+ self.certificate_authorities
+ }
+ 
+}
+
+/// Common configuration for a set of server sessions.
+/// 
+/// Making one of these is cheap, though one of the inputs may be expensive: gathering trust roots
+/// from the operating system to add to the [`RootCertStore`] passed to a `ClientCertVerifier`
+/// builder may take on the order of a few hundred milliseconds.
+/// 
+/// These must be created via the [`ServerConfig::builder()`] or [`ServerConfig::builder_with_provider()`]
+/// function.
+/// 
+/// # Defaults
+/// 
+/// * [`ServerConfig::max_fragment_size`]: the default is `None` (meaning 16kB).
+/// * [`ServerConfig::session_storage`]: if the `std` feature is enabled, the default stores 256
+/// sessions in memory. If the `std` feature is not enabled, the default is to not store any
+/// sessions. In a no-std context, by enabling the `hashbrown` feature you may provide your
+/// own `session_storage` using [`ServerSessionMemoryCache`] and a `crate::lock::MakeMutex`
+/// implementation.
+/// * [`ServerConfig::alpn_protocols`]: the default is empty -- no ALPN protocol is negotiated.
+/// * [`ServerConfig::key_log`]: key material is not logged.
+/// * [`ServerConfig::send_tls13_tickets`]: 2 tickets are sent.
+/// * [`ServerConfig::cert_compressors`]: depends on the crate features, see [`compress::default_cert_compressors()`].
+/// * [`ServerConfig::cert_compression_cache`]: caches the most recently used 4 compressions
+/// * [`ServerConfig::cert_decompressors`]: depends on the crate features, see [`compress::default_cert_decompressors()`].
+/// 
+/// [`RootCertStore`]: crate::RootCertStore
+/// [`ServerSessionMemoryCache`]: crate::server::handy::ServerSessionMemoryCache
+#[derive(Clone, Debug)]
+pub struct ServerConfig {
+ provider: Arc<CryptoProvider>,
+ pub ignore_client_order: bool,
+ pub max_fragment_size: Option<usize>,
+ pub session_storage: Arc<_>,
+ pub ticketer: Arc<_>,
+ pub cert_resolver: Arc<_>,
+ pub alpn_protocols: Vec<Vec<u8>>,
+ versions: versions::EnabledVersions,
+ verifier: Arc<_>,
+ pub key_log: Arc<_>,
+ pub enable_secret_extraction: bool,
+ pub max_early_data_size: u32,
+ pub send_half_rtt_data: bool,
+ pub send_tls13_tickets: usize,
+ pub require_ems: bool,
+ pub time_provider: Arc<_>,
+ pub cert_compressors: Vec<&_>,
+ pub cert_compression_cache: Arc<compress::CompressionCache>,
+ pub cert_decompressors: Vec<&_>,
+}
+
+impl ServerConfig {
+ pub fn builder() -> ConfigBuilder<Self, WantsVerifier> {
+ Self::builder_with_protocol_versions(versions::DEFAULT_VERSIONS)
+ }
+ 
+ pub fn builder_with_protocol_versions(versions: &[&versions::SupportedProtocolVersion]) -> ConfigBuilder<Self, WantsVerifier> {
+ Self::builder_with_provider(Arc::clone(CryptoProvider::get_default_or_install_from_crate_features() )).with_protocol_versions(versions).unwrap()
+ }
+ 
+ pub fn builder_with_provider(provider: Arc<CryptoProvider>) -> ConfigBuilder<Self, WantsVersions> {
+ ConfigBuilder { state: WantsVersions { }, provider, time_provider: Arc::new(DefaultTimeProvider), side: PhantomData }
+ }
+ 
+ pub fn builder_with_details(provider: Arc<CryptoProvider>, time_provider: Arc<_>) -> ConfigBuilder<Self, WantsVersions> {
+ ConfigBuilder { state: WantsVersions { }, provider, time_provider, side: PhantomData }
+ }
+ 
+ pub fn fips(&self) -> bool {
+ #[cfg(feature = "tls12")] { self.provider.fips() &&self.require_ems }
+ #[cfg(not(feature = "tls12"))] { self.provider.fips() }
+ }
+ 
+ pub fn crypto_provider(&self) -> &Arc<CryptoProvider> {
+ &self.provider
+ }
+ 
+ fn supports_version(&self, v: ProtocolVersion) -> bool {
+ self.versions.contains(v) &&self.provider.cipher_suites.iter().any(| cs | cs.version().version == v)
+ }
+ 
+ fn supports_protocol(&self, proto: Protocol) -> bool {
+ self.provider.cipher_suites.iter().any(| cs | cs.usable_for_protocol(proto))
+ }
+ 
+ fn current_time(&self) -> Result<UnixTime, Error> {
+ self.time_provider.current_time().ok_or(Error::FailedToGetCurrentTime)
+ }
+ 
+}
+
+#[cfg(feature = "std")]
+mod connection {
+ use alloc::boxed::Box;
+ use alloc::vec::Vec;
+ use core::fmt;
+ use core::fmt::{ Debug, Formatter };
+ use core::ops::{ Deref, DerefMut };
+ use std::io;
+ use super::{ Accepted, Accepting, EarlyDataState, ServerConfig, ServerConnectionData };
+ use crate::common_state::{ CommonState, Context, Side };
+ use crate::conn::{ ConnectionCommon, ConnectionCore };
+ use crate::error::Error;
+ use crate::server::hs;
+ use crate::suites::ExtractedSecrets;
+ use crate::sync::Arc;
+ use crate::vecbuf::ChunkVecBuffer;
+ /// Allows reading of early data in resumed TLS1.3 connections.
+ /// 
+ /// "Early data" is also known as "0-RTT data".
+ /// 
+ /// This structure implements [`std::io::Read`].
+ pub struct ReadEarlyData<a> {
+ early_data: &mut EarlyDataState,
+ }
+ 
+ impl<a> ReadEarlyData<'a> {
+ fn new(early_data: &mut EarlyDataState) -> Self {
+ ReadEarlyData { early_data }
+ }
+ 
+ }
+ 
+ impl io::Read for ReadEarlyData<'_> {
+ fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+ self.early_data.read(buf)
+ }
+ 
+ fn read_buf(&mut self, cursor: core::io::BorrowedCursor<'_>) -> io::Result<()> {
+ self.early_data.read_buf(cursor)
+ }
+ 
+ }
+ 
+ /// This represents a single TLS server connection.
+ /// 
+ /// Send TLS-protected data to the peer using the `io::Write` trait implementation.
+ /// Read data from the peer using the `io::Read` trait implementation.
+ pub struct ServerConnection {
+ inner: ConnectionCommon<ServerConnectionData>,
+ }
+ 
+ impl ServerConnection {
+ pub fn new(config: Arc<ServerConfig>) -> Result<Self, Error> {
+ Ok(Self { inner: ConnectionCommon::from(ConnectionCore::for_server(config, Vec::new()) ?) })
+ }
+ 
+ pub fn server_name(&self) -> Option<&str> {
+ self.inner.core.get_sni_str()
+ }
+ 
+ pub fn received_resumption_data(&self) -> Option<&[u8]> {
+ self.inner.core.data.received_resumption_data.as_ref().map(| x | &x [..])
+ }
+ 
+ pub fn set_resumption_data(&mut self, data: &[u8]) {
+ assert!(data.len()<2usize.pow(15));
+ self.inner.core.data.resumption_data = data.into();
+ }
+ 
+ pub fn reject_early_data(&mut self) {
+ self.inner.core.reject_early_data()
+ }
+ 
+ pub fn early_data(&mut self) -> Option<ReadEarlyData<'_>> {
+ let data = &mut self.inner.core.data;
+ if data.early_data.was_accepted() { Some(ReadEarlyData::new(&mut data.early_data)) } else { None }
+ }
+ 
+ pub fn fips(&self) -> bool {
+ self.inner.core.common_state.fips
+ }
+ 
+ pub fn dangerous_extract_secrets(self) -> Result<ExtractedSecrets, Error> {
+ self.inner.dangerous_extract_secrets()
+ }
+ 
+ }
+ 
+ impl Debug for ServerConnection {
+ fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+ f.debug_struct("ServerConnection").finish()
+ }
+ 
+ }
+ 
+ impl Deref for ServerConnection {
+ type Target = ConnectionCommon<ServerConnectionData>;
+ fn deref(&self) -> &Self::Target {
+ &self.inner
+ }
+ 
+ }
+ 
+ impl DerefMut for ServerConnection {
+ fn deref_mut(&mut self) -> &mut Self::Target {
+ &mut self.inner
+ }
+ 
+ }
+ 
+ impl From<ServerConnection> for crate::Connection {
+ fn from(conn: ServerConnection) -> Self {
+ Self::Server(conn)
+ }
+ 
+ }
+ 
+ /// Handle a server-side connection before configuration is available.
+ /// 
+ /// `Acceptor` allows the caller to choose a [`ServerConfig`] after reading
+ /// the [`super::ClientHello`] of an incoming connection. This is useful for servers
+ /// that choose different certificates or cipher suites based on the
+ /// characteristics of the `ClientHello`. In particular it is useful for
+ /// servers that need to do some I/O to load a certificate and its private key
+ /// and don't want to use the blocking interface provided by
+ /// [`super::ResolvesServerCert`].
+ /// 
+ /// Create an Acceptor with [`Acceptor::default()`].
+ /// 
+ /// # Example
+ /// 
+ /// ```no_run
+ /// # #[cfg(feature = "aws_lc_rs")] {
+ /// # fn choose_server_config(
+ /// # _: rustls::server::ClientHello,
+ /// # ) -> std::sync::Arc<rustls::ServerConfig> {
+ /// # unimplemented!();
+ /// # }
+ /// # #[allow(unused_variables)]
+ /// # fn main() {
+ /// use rustls::server::{Acceptor, ServerConfig};
+ /// let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+ /// for stream in listener.incoming() {
+ /// let mut stream = stream.unwrap();
+ /// let mut acceptor = Acceptor::default();
+ /// let accepted = loop {
+ /// acceptor.read_tls(&mut stream).unwrap();
+ /// if let Some(accepted) = acceptor.accept().unwrap() {
+ /// break accepted;
+ /// }
+ /// };
+ /// 
+ /// // For some user-defined choose_server_config:
+ /// let config = choose_server_config(accepted.client_hello());
+ /// let conn = accepted
+ /// .into_connection(config)
+ /// .unwrap();
+ /// 
+ /// // Proceed with handling the ServerConnection.
+ /// }
+ /// # }
+ /// # }
+ /// ```
+ pub struct Acceptor {
+ inner: Option<ConnectionCommon<ServerConnectionData>>,
+ }
+ 
+ impl Default for Acceptor {
+ fn default() -> Self {
+ Self { inner: Some(ConnectionCore::new(Box::new(Accepting), ServerConnectionData::default(), CommonState::new(Side::Server) ).into() ) }
+ }
+ 
+ }
+ 
+ impl Acceptor {
+ pub fn read_tls(&mut self, rd: &mut _) -> Result<usize, io::Error> {
+ match &mut self.inner { Some(conn) => conn.read_tls(rd), None => Err(io::Error::new(io::ErrorKind::Other, "acceptor cannot read after successful acceptance" )) }
+ }
+ 
+ pub fn accept(&mut self) -> Result<Option<Accepted>, (Error, AcceptedAlert)> {
+ let _ = self.inner.take();
+ let message = match connection.first_handshake_message() { Ok(Some(msg)) => msg, Ok(None) => { self.inner = Some(connection); return Ok(None); } Err(err) => return Err((err, AcceptedAlert::from(connection))) };
+ let mut cx = Context::from(&mut connection);
+ let sig_schemes = match hs::process_client_hello(&message, false, &mut cx) { Ok((_, sig_schemes)) => sig_schemes, Err(err) => { return Err((err, AcceptedAlert::from(connection))); } };
+ Ok(Some(Accepted { connection, message, sig_schemes }))
+ }
+ 
+ }
+ 
+ /// Represents a TLS alert resulting from handling the client's `ClientHello` message.
+ /// 
+ /// When [`Acceptor::accept()`] returns an error, it yields an `AcceptedAlert` such that the
+ /// application can communicate failure to the client via [`AcceptedAlert::write()`].
+ pub struct AcceptedAlert {
+ (ChunkVecBuffer),
+ }
+ 
+ impl AcceptedAlert {
+ fn empty() -> Self {
+ Self(ChunkVecBuffer::new(None))
+ }
+ 
+ pub fn write(&mut self, wr: &mut _) -> Result<usize, io::Error> {
+ self.0.write_to(wr)
+ }
+ 
+ pub fn write_all(&mut self, wr: &mut _) -> Result<(), io::Error> {
+ while self.write(wr) ? != 0 { }
+ Ok(())
+ }
+ 
+ }
+ 
+ impl From<ConnectionCommon<ServerConnectionData>> for AcceptedAlert {
+ fn from(conn: ConnectionCommon<ServerConnectionData>) -> Self {
+ Self(conn.core.common_state.sendable_tls)
+ }
+ 
+ }
+ 
+ impl Debug for AcceptedAlert {
+ fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+ f.debug_struct("AcceptedAlert").finish()
+ }
+ 
+ }
+ 
+}
+
+#[cfg(feature = "std")] pub use connection::{ AcceptedAlert, Acceptor, ReadEarlyData, ServerConnection };
+/// Unbuffered version of `ServerConnection`
+/// 
+/// See the [`crate::unbuffered`] module docs for more details
+pub struct UnbufferedServerConnection {
+ inner: UnbufferedConnectionCommon<ServerConnectionData>,
+}
+
+impl UnbufferedServerConnection {
+ pub fn new(config: Arc<ServerConfig>) -> Result<Self, Error> {
+ Ok(Self { inner: UnbufferedConnectionCommon::from(ConnectionCore::for_server(config, Vec::new() ) ?) })
+ }
+ 
+}
+
+impl Deref for UnbufferedServerConnection {
+ type Target = UnbufferedConnectionCommon<ServerConnectionData>;
+ fn deref(&self) -> &Self::Target {
+ &self.inner
+ }
+ 
+}
+
+impl DerefMut for UnbufferedServerConnection {
+ fn deref_mut(&mut self) -> &mut Self::Target {
+ &mut self.inner
+ }
+ 
+}
+
+impl UnbufferedConnectionCommon<ServerConnectionData> {
+ fn pop_early_data(&mut self) -> Option<Vec<u8>> {
+ self.core.data.early_data.pop()
+ }
+ 
+}
+
+/// Represents a `ClientHello` message received through the [`Acceptor`].
+/// 
+/// Contains the state required to resume the connection through [`Accepted::into_connection()`].
+pub struct Accepted {
+ connection: ConnectionCommon<ServerConnectionData>,
+ message: Message<'static>,
+ sig_schemes: Vec<SignatureScheme>,
+}
+
+impl Accepted {
+ pub fn client_hello(&self) -> ClientHello<'_> {
+ let payload = Self::client_hello_payload(&self.message);
+ let ch = ClientHello { server_name: &self.connection.core.data.sni, signature_schemes: &self.sig_schemes, alpn: payload.alpn_extension(), server_cert_types: payload.server_certificate_extension(), client_cert_types: payload.client_certificate_extension(), cipher_suites: &payload.cipher_suites, certificate_authorities: payload.certificate_authorities_extension() };
+ trace!("Accepted::client_hello(): {ch:#?}");
+ ch
+ }
+ 
+ pub fn into_connection(self, config: Arc<ServerConfig>) -> Result<ServerConnection, (Error, AcceptedAlert)> {
+ if let Err(err) = self.connection.set_max_fragment_size(config.max_fragment_size) { return Err((err, AcceptedAlert::empty())); }
+ self.connection.enable_secret_extraction = config.enable_secret_extraction;
+ let state = hs::ExpectClientHello::new(config, Vec::new());
+ let mut cx = hs::ServerContext::from(&mut self.connection);
+ let ch = Self::client_hello_payload(&self.message);
+ let new = match state.with_certified_key(self.sig_schemes, ch, &self.message, &mut cx) { Ok(new) => new, Err(err) => return Err((err, AcceptedAlert::from(self.connection))) };
+ self.connection.replace_state(new);
+ Ok(ServerConnection { inner: self.connection })
+ }
+ 
+ fn client_hello_payload(message: &Message<'_>) -> &ClientHelloPayload {
+ match &message.payload { crate::msgs::message::MessagePayload::Handshake { parsed, .. } => match &parsed.payload { crate::msgs::handshake::HandshakePayload::ClientHello(ch) => ch, _ => unreachable!() }, _ => unreachable!() }
+ }
+ 
+}
+
+impl Debug for Accepted {
+ fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+ f.debug_struct("Accepted").finish()
+ }
+ 
+}
+
+#[cfg(feature = "std")]
+struct Accepting {
+}
+
+#[cfg(feature = "std")]
+impl State<ServerConnectionData> for Accepting {
+ fn handle(self, _cx: &mut hs::ServerContext<'_>, _m: Message<'m>) -> Result<Box<_>, Error> {
+ Err(Error::General("unreachable state" . into()))
+ }
+ 
+ fn into_owned(self) -> hs::NextState<'static> {
+ self
+ }
+ 
+}
+
+enum EarlyDataState {
+ New,
+ Accepted { received: ChunkVecBuffer, left: usize },
+ Rejected,
+}
+
+impl Default for EarlyDataState {
+ fn default() -> Self {
+ Self::New
+ }
+ 
+}
+
+impl EarlyDataState {
+ fn reject(&mut self) {
+ *self = Self::Rejected;
+ }
+ 
+ fn accept(&mut self, max_size: usize) {
+ *self = Self::Accepted { received: ChunkVecBuffer::new(Some(max_size)), left: max_size };
+ }
+ 
+ fn was_accepted(&self) -> bool {
+ matches!(self, Self::Accepted { .. })
+ }
+ 
+ fn was_rejected(&self) -> bool {
+ matches!(self, Self::Rejected)
+ }
+ 
+ fn pop(&mut self) -> Option<Vec<u8>> {
+ match self { Self::Accepted { ref mut received, .. } => received.pop(), _ => None }
+ }
+ 
+ fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+ match self { Self::Accepted { ref mut received, .. } => received.read(buf), _ => Err(io::Error::from(io::ErrorKind::BrokenPipe)) }
+ }
+ 
+ fn read_buf(&mut self, cursor: core::io::BorrowedCursor<'_>) -> io::Result<()> {
+ match self { Self::Accepted { ref mut received, .. } => received.read_buf(cursor), _ => Err(io::Error::from(io::ErrorKind::BrokenPipe)) }
+ }
+ 
+ fn take_received_plaintext(&mut self, bytes: Payload<'_>) -> bool {
+ let available = bytes.bytes().len();
+ match self { Self::Accepted { ref mut received, ref mut left } if received.apply_limit(available) == available &&available <= *left => { received.append(bytes.into_vec()); *left -= available; true } _ => false }
+ }
+ 
+}
+
+impl Debug for EarlyDataState {
+ fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+ match self { Self::New => write!(f, "EarlyDataState::New"), Self::Accepted { received, left } => write!(f, "EarlyDataState::Accepted {{ received: {}, left: {} }}", received.len(), left), Self::Rejected => write!(f, "EarlyDataState::Rejected") }
+ }
+ 
+}
+
+impl ConnectionCore<ServerConnectionData> {
+ fn for_server(config: Arc<ServerConfig>, extra_exts: Vec<ServerExtension>) -> Result<Self, Error> {
+ let mut common = CommonState::new(Side::Server);
+ common.set_max_fragment_size(config.max_fragment_size) ?;
+ common.enable_secret_extraction = config.enable_secret_extraction;
+ common.fips = config.fips();
+ Ok(Self::new(Box::new(hs::ExpectClientHello::new(config, extra_exts)), ServerConnectionData::default(), common ))
+ }
+ 
+ fn reject_early_data(&mut self) {
+ assert!(self.common_state.is_handshaking(), "cannot retroactively reject early data");
+ self.data.early_data.reject();
+ }
+ 
+ fn get_sni_str(&self) -> Option<&str> {
+ self.data.get_sni_str()
+ }
+ 
+}
+
+/// State associated with a server connection.
+#[derive(Default, Debug)]
+pub struct ServerConnectionData {
+ sni: Option<DnsName<'static>>,
+ received_resumption_data: Option<Vec<u8>>,
+ resumption_data: Vec<u8>,
+ early_data: EarlyDataState,
+}
+
+impl ServerConnectionData {
+ fn get_sni_str(&self) -> Option<&str> {
+ self.sni.as_ref().map(AsRef::as_ref)
+ }
+ 
+}
+
+impl crate::conn::SideData for ServerConnectionData {
+}
+
+#[cfg(feature = "std")]
+#[cfg(test)]
+mod tests {
+ use std::format;
+ use super::*;
+ #[test]
+ fn test_read_in_new_state() {
+ assert_eq!(format!("{:?}", EarlyDataState::default().read(&mut [0u8; 5])), "Err(Kind(BrokenPipe))");
+ }
+ 
+ #[cfg(read_buf)]
+ #[test]
+ fn test_read_buf_in_new_state() {
+ use core::io::BorrowedBuf;
+ let mut buf = [0u8; 5];
+ let _ = buf.as_mut_slice().into();
+ assert_eq!(format!("{:?}", EarlyDataState::default().read_buf(buf.unfilled())), "Err(Kind(BrokenPipe))");
+ }
+ 
+}
+

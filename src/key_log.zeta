@@ -1,0 +1,36 @@
+// Auto-converted from /tmp/df-rustls-0.23.23/rustls-0.23.23/src/key_log.rs
+
+use core::fmt::Debug;
+#[cfg(all(doc, feature = "std"))] use crate::KeyLogFile;
+/// This trait represents the ability to do something useful
+/// with key material, such as logging it to a file for debugging.
+/// 
+/// Naturally, secrets passed over the interface are *extremely*
+/// sensitive and can break the security of past, present and
+/// future sessions.
+/// 
+/// You'll likely want some interior mutability in your
+/// implementation to make this useful.
+/// 
+/// See [`KeyLogFile`] that implements the standard
+/// `SSLKEYLOGFILE` environment variable behaviour.
+pub trait KeyLog {
+ fn log(&self, label: &str, client_random: &[u8], secret: &[u8]);
+ fn will_log(&self, _label: &str) -> bool
+}
+
+/// KeyLog that does exactly nothing.
+#[derive(Debug)]
+pub struct NoKeyLog {
+}
+
+impl KeyLog for NoKeyLog {
+ fn log(&self, _: &str, _: &[u8], _: &[u8]) {
+ }
+ 
+ fn will_log(&self, _label: &str) -> bool {
+ false
+ }
+ 
+}
+

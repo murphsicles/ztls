@@ -1,0 +1,452 @@
+// Auto-converted from /tmp/df-rustls-0.23.23/rustls-0.23.23/src/common_state.rs
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use pki_types::CertificateDer;
+use crate::crypto::SupportedKxGroup;
+use crate::enums::{ AlertDescription, ContentType, HandshakeType, ProtocolVersion };
+use crate::error::{ Error, InvalidMessage, PeerMisbehaved };
+use crate::hash_hs::HandshakeHash;
+use crate::log::{ debug, error, warn };
+use crate::msgs::alert::AlertMessagePayload;
+use crate::msgs::base::Payload;
+use crate::msgs::codec::Codec;
+use crate::msgs::enums::{ AlertLevel, KeyUpdateRequest };
+use crate::msgs::fragmenter::MessageFragmenter;
+use crate::msgs::handshake::{ CertificateChain, HandshakeMessagePayload };
+use crate::msgs::message::{ Message, MessagePayload, OutboundChunks, OutboundOpaqueMessage, OutboundPlainMessage, PlainMessage };
+use crate::record_layer::PreEncryptAction;
+use crate::suites::{ PartiallyExtractedSecrets, SupportedCipherSuite };
+#[cfg(feature = "tls12")] use crate::tls12::ConnectionSecrets;
+use crate::unbuffered::{ EncryptError, InsufficientSizeError };
+use crate::vecbuf::ChunkVecBuffer;
+use crate::{ quic, record_layer };
+/// Connection state common to both client and server connections.
+pub struct CommonState {
+ negotiated_version: Option<ProtocolVersion>,
+ handshake_kind: Option<HandshakeKind>,
+ side: Side,
+ record_layer: record_layer::RecordLayer,
+ suite: Option<SupportedCipherSuite>,
+ kx_state: KxState,
+ alpn_protocol: Option<Vec<u8>>,
+ aligned_handshake: bool,
+ may_send_application_data: bool,
+ may_receive_application_data: bool,
+ early_traffic: bool,
+ sent_fatal_alert: bool,
+ has_sent_close_notify: bool,
+ has_received_close_notify: bool,
+ has_seen_eof: bool,
+ peer_certificates: Option<CertificateChain<'static>>,
+ message_fragmenter: MessageFragmenter,
+ received_plaintext: ChunkVecBuffer,
+ sendable_tls: ChunkVecBuffer,
+ queued_key_update_message: Option<Vec<u8>>,
+ protocol: Protocol,
+ quic: quic::Quic,
+ enable_secret_extraction: bool,
+ temper_counters: TemperCounters,
+ refresh_traffic_keys_pending: bool,
+ fips: bool,
+}
+
+impl CommonState {
+ fn new(side: Side) -> Self {
+ Self { negotiated_version: None, handshake_kind: None, side, record_layer: record_layer::RecordLayer::new(), suite: None, kx_state: KxState::default(), alpn_protocol: None, aligned_handshake: true, may_send_application_data: false, may_receive_application_data: false, early_traffic: false, sent_fatal_alert: false, has_sent_close_notify: false, has_received_close_notify: false, #[cfg(feature = "std")] has_seen_eof: false, peer_certificates: None, message_fragmenter: MessageFragmenter::default(), received_plaintext: ChunkVecBuffer::new(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT)), sendable_tls: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)), queued_key_update_message: None, protocol: Protocol::Tcp, quic: quic::Quic::default(), enable_secret_extraction: false, temper_counters: TemperCounters::default(), refresh_traffic_keys_pending: false, fips: false }
+ }
+ 
+ pub fn wants_write(&self) -> bool {
+ ! self.sendable_tls.is_empty()
+ }
+ 
+ pub fn is_handshaking(&self) -> bool {
+!(self.may_send_application_data &&self.may_receive_application_data)
+ }
+ 
+ pub fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
+ self.peer_certificates.as_deref()
+ }
+ 
+ pub fn alpn_protocol(&self) -> Option<&[u8]> {
+ self.get_alpn_protocol()
+ }
+ 
+ pub fn negotiated_cipher_suite(&self) -> Option<SupportedCipherSuite> {
+ self.suite
+ }
+ 
+ pub fn negotiated_key_exchange_group(&self) -> Option<&_> {
+ match self.kx_state { KxState::Complete(group) => Some(group), _ => None }
+ }
+ 
+ pub fn protocol_version(&self) -> Option<ProtocolVersion> {
+ self.negotiated_version
+ }
+ 
+ pub fn handshake_kind(&self) -> Option<HandshakeKind> {
+ self.handshake_kind
+ }
+ 
+ fn is_tls13(&self) -> bool {
+ matches!(self.negotiated_version, Some(ProtocolVersion::TLSv1_3))
+ }
+ 
+ fn process_main_protocol(&mut self, msg: Message<'_>, state: Box<_>, data: &mut Data, sendable_plaintext: Option<&mut ChunkVecBuffer>) -> Result<Box<_>, Error> {
+ if self.may_receive_application_data && ! self.is_tls13() { let reject_ty = match self.side { Side::Client => HandshakeType::HelloRequest, Side::Server => HandshakeType::ClientHello }; if msg.is_handshake_type(reject_ty) { self.temper_counters.received_renegotiation_request() ?; self.send_warning_alert(AlertDescription::NoRenegotiation); return Ok(state); } }
+ let mut cx = Context { common: self, data, sendable_plaintext };
+ match state.handle(&mut cx, msg) { Ok(next) => { state = next.into_owned(); Ok(state) } Err(e @ Error::InappropriateMessage { .. }) | Err(e @ Error::InappropriateHandshakeMessage { .. }) => { Err(self.send_fatal_alert(AlertDescription::UnexpectedMessage, e)) } Err(e) => Err(e) }
+ }
+ 
+ fn write_plaintext(&mut self, payload: OutboundChunks<'_>, outgoing_tls: &mut [u8]) -> Result<usize, EncryptError> {
+ if payload.is_empty() { return Ok(0); }
+ let fragments = self.message_fragmenter.fragment_payload(ContentType::ApplicationData, ProtocolVersion::TLSv1_2, payload.clone() );
+ for f in 0 .. fragments.len() { match self.record_layer.pre_encrypt_action(f as u64) { PreEncryptAction::Nothing => { } PreEncryptAction::RefreshOrClose => match self.negotiated_version { Some(ProtocolVersion::TLSv1_3) => { self.refresh_traffic_keys_pending = true; } _ => { error!("traffic keys exhausted, closing connection to prevent security failure"); self.send_close_notify(); return Err(EncryptError::EncryptExhausted); } }, PreEncryptAction::Refuse => { return Err(EncryptError::EncryptExhausted); } } }
+ self.perhaps_write_key_update();
+ self.check_required_size(outgoing_tls, fragments) ?;
+ let fragments = self.message_fragmenter.fragment_payload(ContentType::ApplicationData, ProtocolVersion::TLSv1_2, payload );
+ Ok(self.write_fragments(outgoing_tls, fragments))
+ }
+ 
+ fn check_aligned_handshake(&mut self) -> Result<(), Error> {
+ if ! self.aligned_handshake { Err(self.send_fatal_alert(AlertDescription::UnexpectedMessage, PeerMisbehaved::KeyEpochWithPendingFragment )) } else { Ok(()) }
+ }
+ 
+ fn send_msg_encrypt(&mut self, m: PlainMessage) {
+ let iter = self.message_fragmenter.fragment_message(&m);
+ for m in iter { self.send_single_fragment(m); }
+ }
+ 
+ fn send_appdata_encrypt(&mut self, payload: OutboundChunks<'_>, limit: Limit) -> usize {
+ let len = match limit { #[cfg(feature = "std")] Limit::Yes => self.sendable_tls.apply_limit(payload.len()), Limit::No => payload.len() };
+ let iter = self.message_fragmenter.fragment_payload(ContentType::ApplicationData, ProtocolVersion::TLSv1_2, payload.split_at(len).0 );
+ for m in iter { self.send_single_fragment(m); }
+ len
+ }
+ 
+ fn send_single_fragment(&mut self, m: OutboundPlainMessage<'_>) {
+ if m.typ == ContentType::Alert { let em = self.record_layer.encrypt_outgoing(m); self.queue_tls_message(em); return; }
+ match self.record_layer.next_pre_encrypt_action() { PreEncryptAction::Nothing => { } PreEncryptAction::RefreshOrClose => { match self.negotiated_version { Some(ProtocolVersion::TLSv1_3) => { self.refresh_traffic_keys_pending = true; } _ => { error!("traffic keys exhausted, closing connection to prevent security failure"); self.send_close_notify(); return; } } } PreEncryptAction::Refuse => { return; } };
+ let em = self.record_layer.encrypt_outgoing(m);
+ self.queue_tls_message(em);
+ }
+ 
+ fn send_plain_non_buffering(&mut self, payload: OutboundChunks<'_>, limit: Limit) -> usize {
+ debug_assert!(self.may_send_application_data);
+ debug_assert!(self.record_layer.is_encrypting());
+ if payload.is_empty() { return 0; }
+ self.send_appdata_encrypt(payload, limit)
+ }
+ 
+ fn start_outgoing_traffic(&mut self, sendable_plaintext: &mut Option<&mut ChunkVecBuffer>) {
+ self.may_send_application_data = true;
+ if let Some(sendable_plaintext) = sendable_plaintext { self.flush_plaintext(sendable_plaintext); }
+ }
+ 
+ fn start_traffic(&mut self, sendable_plaintext: &mut Option<&mut ChunkVecBuffer>) {
+ self.may_receive_application_data = true;
+ self.start_outgoing_traffic(sendable_plaintext);
+ }
+ 
+ fn flush_plaintext(&mut self, sendable_plaintext: &mut ChunkVecBuffer) {
+ if ! self.may_send_application_data { return; }
+ while let Some(buf) = sendable_plaintext.pop() { self.send_plain_non_buffering(buf.as_slice().into(), Limit::No); }
+ }
+ 
+ fn queue_tls_message(&mut self, m: OutboundOpaqueMessage) {
+ self.perhaps_write_key_update();
+ self.sendable_tls.append(m.encode());
+ }
+ 
+ fn perhaps_write_key_update(&mut self) {
+ if let Some(message) = self.queued_key_update_message.take() { self.sendable_tls.append(message); }
+ }
+ 
+ fn send_msg(&mut self, m: Message<'_>, must_encrypt: bool) {
+ { if let Protocol::Quic = self.protocol { if let MessagePayload::Alert(alert) = m.payload { self.quic.alert = Some(alert.description); } else { debug_assert!(matches!(m.payload, MessagePayload::Handshake { .. } | MessagePayload::HandshakeFlight(_)), "QUIC uses TLS for the cryptographic handshake only"); let mut bytes = Vec::new(); m.payload.encode(&mut bytes); self.quic.hs_queue.push_back((must_encrypt, bytes)); } return; } }
+ if ! must_encrypt { let msg = &m.into(); let iter = self.message_fragmenter.fragment_message(msg); for m in iter { self.queue_tls_message(m.to_unencrypted_opaque()); } } else { self.send_msg_encrypt(m.into()); }
+ }
+ 
+ fn take_received_plaintext(&mut self, bytes: Payload<'_>) {
+ self.received_plaintext.append(bytes.into_vec());
+ }
+ 
+ fn start_encryption_tls12(&mut self, secrets: &ConnectionSecrets, side: Side) {
+ let _ = secrets.make_cipher_pair(side);
+ self.record_layer.prepare_message_encrypter(enc, secrets.suite().common.confidentiality_limit );
+ self.record_layer.prepare_message_decrypter(dec);
+ }
+ 
+ fn missing_extension(&mut self, why: PeerMisbehaved) -> Error {
+ self.send_fatal_alert(AlertDescription::MissingExtension, why)
+ }
+ 
+ fn send_warning_alert(&mut self, desc: AlertDescription) {
+ warn!("Sending warning alert {:?}", desc);
+ self.send_warning_alert_no_log(desc);
+ }
+ 
+ fn process_alert(&mut self, alert: &AlertMessagePayload) -> Result<(), Error> {
+ if let AlertLevel::Unknown(_) = alert.level { return Err(self.send_fatal_alert(AlertDescription::IllegalParameter, Error::AlertReceived(alert.description) )); }
+ if self.may_receive_application_data &&alert.description == AlertDescription::CloseNotify { self.has_received_close_notify = true; return Ok(()); }
+ let err = Error::AlertReceived(alert.description);
+ if alert.level == AlertLevel::Warning { self.temper_counters.received_warning_alert() ?; if self.is_tls13() &&alert.description != AlertDescription::UserCanceled { return Err(self.send_fatal_alert(AlertDescription::DecodeError, err)); } if alert.description != AlertDescription::UserCanceled || cfg!(debug_assertions) { warn!("TLS alert warning received: {alert:?}"); } return Ok(()); }
+ Err(err)
+ }
+ 
+ fn send_cert_verify_error_alert(&mut self, err: Error) -> Error {
+ self.send_fatal_alert(match &err { Error::InvalidCertificate(e) => e.clone().into(), Error::PeerMisbehaved(_) => AlertDescription::IllegalParameter, _ => AlertDescription::HandshakeFailure }, err )
+ }
+ 
+ fn send_fatal_alert(&mut self, desc: AlertDescription, err: impl Into<Error>) -> Error {
+ debug_assert!(! self.sent_fatal_alert);
+ let m = Message::build_alert(AlertLevel::Fatal, desc);
+ self.send_msg(m, self.record_layer.is_encrypting());
+ self.sent_fatal_alert = true;
+ err.into()
+ }
+ 
+ pub fn send_close_notify(&mut self) {
+ if self.sent_fatal_alert { return; }
+ debug!("Sending warning alert {:?}", AlertDescription::CloseNotify);
+ self.sent_fatal_alert = true;
+ self.has_sent_close_notify = true;
+ self.send_warning_alert_no_log(AlertDescription::CloseNotify);
+ }
+ 
+ fn eager_send_close_notify(&mut self, outgoing_tls: &mut [u8]) -> Result<usize, EncryptError> {
+ self.send_close_notify();
+ self.check_required_size(outgoing_tls, [] . into_iter()) ?;
+ Ok(self.write_fragments(outgoing_tls, [] . into_iter()))
+ }
+ 
+ fn send_warning_alert_no_log(&mut self, desc: AlertDescription) {
+ let m = Message::build_alert(AlertLevel::Warning, desc);
+ self.send_msg(m, self.record_layer.is_encrypting());
+ }
+ 
+ fn check_required_size(&self, outgoing_tls: &mut [u8], fragments: impl Iterator<_>) -> Result<(), EncryptError> {
+ let mut required_size = self.sendable_tls.len();
+ for m in fragments { required_size += m.encoded_len(&self.record_layer); }
+ if required_size > outgoing_tls.len() { return Err(EncryptError::InsufficientSize(InsufficientSizeError { required_size })); }
+ Ok(())
+ }
+ 
+ fn write_fragments(&mut self, outgoing_tls: &mut [u8], fragments: impl Iterator<_>) -> usize {
+ let mut written = 0;
+ while let Some(message) = self.sendable_tls.pop() { let len = message.len(); outgoing_tls [written .. written + len] . copy_from_slice(&message); written += len; }
+ for m in fragments { let em = self.record_layer.encrypt_outgoing(m).encode(); let len = em.len(); outgoing_tls [written .. written + len] . copy_from_slice(&em); written += len; }
+ written
+ }
+ 
+ fn set_max_fragment_size(&mut self, new: Option<usize>) -> Result<(), Error> {
+ self.message_fragmenter.set_max_fragment_size(new)
+ }
+ 
+ fn get_alpn_protocol(&self) -> Option<&[u8]> {
+ self.alpn_protocol.as_ref().map(AsRef::as_ref)
+ }
+ 
+ pub fn wants_read(&self) -> bool {
+ self.received_plaintext.is_empty() && ! self.has_received_close_notify && (self.may_send_application_data || self.sendable_tls.is_empty())
+ }
+ 
+ fn current_io_state(&self) -> IoState {
+ IoState { tls_bytes_to_write: self.sendable_tls.len(), plaintext_bytes_to_read: self.received_plaintext.len(), peer_has_closed: self.has_received_close_notify }
+ }
+ 
+ fn is_quic(&self) -> bool {
+ self.protocol == Protocol::Quic
+ }
+ 
+ fn should_update_key(&mut self, key_update_request: &KeyUpdateRequest) -> Result<bool, Error> {
+ self.temper_counters.received_key_update_request() ?;
+ match key_update_request { KeyUpdateRequest::UpdateNotRequested => Ok(false), KeyUpdateRequest::UpdateRequested => Ok(self.queued_key_update_message.is_none()), _ => Err(self.send_fatal_alert(AlertDescription::IllegalParameter, InvalidMessage::InvalidKeyUpdate )) }
+ }
+ 
+ fn enqueue_key_update_notification(&mut self) {
+ let message = PlainMessage::from(Message::build_key_update_notify());
+ self.queued_key_update_message = Some(self.record_layer.encrypt_outgoing(message.borrow_outbound()).encode() );
+ }
+ 
+ fn received_tls13_change_cipher_spec(&mut self) -> Result<(), Error> {
+ self.temper_counters.received_tls13_change_cipher_spec()
+ }
+ 
+}
+
+#[cfg(feature = "std")]
+impl CommonState {
+ fn buffer_plaintext(&mut self, payload: OutboundChunks<'_>, sendable_plaintext: &mut ChunkVecBuffer) -> usize {
+ self.perhaps_write_key_update();
+ self.send_plain(payload, Limit::Yes, sendable_plaintext)
+ }
+ 
+ fn send_early_plaintext(&mut self, data: &[u8]) -> usize {
+ debug_assert!(self.early_traffic);
+ debug_assert!(self.record_layer.is_encrypting());
+ if data.is_empty() { return 0; }
+ self.send_appdata_encrypt(data.into(), Limit::Yes)
+ }
+ 
+ fn send_plain(&mut self, payload: OutboundChunks<'_>, limit: Limit, sendable_plaintext: &mut ChunkVecBuffer) -> usize {
+ if ! self.may_send_application_data { let len = match limit { Limit::Yes => sendable_plaintext.append_limited_copy(payload), Limit::No => sendable_plaintext.append(payload.to_vec()) }; return len; }
+ self.send_plain_non_buffering(payload, limit)
+ }
+ 
+}
+
+/// Describes which sort of handshake happened.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum HandshakeKind {
+ Full,
+ FullWithHelloRetryRequest,
+ Resumed,
+}
+
+/// Values of this structure are returned from [`Connection::process_new_packets`]
+/// and tell the caller the current I/O state of the TLS connection.
+/// 
+/// [`Connection::process_new_packets`]: crate::Connection::process_new_packets
+#[derive(Debug, Eq, PartialEq)]
+pub struct IoState {
+ tls_bytes_to_write: usize,
+ plaintext_bytes_to_read: usize,
+ peer_has_closed: bool,
+}
+
+impl IoState {
+ pub fn tls_bytes_to_write(&self) -> usize {
+ self.tls_bytes_to_write
+ }
+ 
+ pub fn plaintext_bytes_to_read(&self) -> usize {
+ self.plaintext_bytes_to_read
+ }
+ 
+ pub fn peer_has_closed(&self) -> bool {
+ self.peer_has_closed
+ }
+ 
+}
+
+trait State<Data> {
+ fn handle<m>(self, cx: &mut Context<'_, Data>, message: Message<'m>) -> Result<Box<_>, Error> where Self: m;
+ fn export_keying_material(&self, _output: &mut [u8], _label: &[u8], _context: Option<&[u8]>) -> Result<(), Error>;
+ fn extract_secrets(&self) -> Result<PartiallyExtractedSecrets, Error>;
+ fn send_key_update_request(&mut self, _common: &mut CommonState) -> Result<(), Error>;
+ fn handle_decrypt_error(&self);
+ fn into_owned(self) -> Box<_>
+}
+
+struct Context<a, Data> {
+ common: &mut CommonState,
+ data: &mut Data,
+ sendable_plaintext: Option<&mut ChunkVecBuffer>,
+}
+
+/// Side of the connection.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Side {
+ Client,
+ Server,
+}
+
+impl Side {
+ fn peer(&self) -> Self {
+ match self { Self::Client => Self::Server, Self::Server => Self::Client }
+ }
+ 
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum Protocol {
+ Tcp,
+ Quic,
+}
+
+enum Limit {
+ Yes,
+ No,
+}
+
+/// Tracking technically-allowed protocol actions
+/// that we limit to avoid denial-of-service vectors.
+struct TemperCounters {
+ allowed_warning_alerts: u8,
+ allowed_renegotiation_requests: u8,
+ allowed_key_update_requests: u8,
+ allowed_middlebox_ccs: u8,
+}
+
+impl TemperCounters {
+ fn received_warning_alert(&mut self) -> Result<(), Error> {
+ match self.allowed_warning_alerts { 0 => Err(PeerMisbehaved::TooManyWarningAlertsReceived.into()), _ => { self.allowed_warning_alerts -= 1; Ok(()) } }
+ }
+ 
+ fn received_renegotiation_request(&mut self) -> Result<(), Error> {
+ match self.allowed_renegotiation_requests { 0 => Err(PeerMisbehaved::TooManyRenegotiationRequests.into()), _ => { self.allowed_renegotiation_requests -= 1; Ok(()) } }
+ }
+ 
+ fn received_key_update_request(&mut self) -> Result<(), Error> {
+ match self.allowed_key_update_requests { 0 => Err(PeerMisbehaved::TooManyKeyUpdateRequests.into()), _ => { self.allowed_key_update_requests -= 1; Ok(()) } }
+ }
+ 
+ fn received_tls13_change_cipher_spec(&mut self) -> Result<(), Error> {
+ match self.allowed_middlebox_ccs { 0 => Err(PeerMisbehaved::IllegalMiddleboxChangeCipherSpec.into()), _ => { self.allowed_middlebox_ccs -= 1; Ok(()) } }
+ }
+ 
+}
+
+impl Default for TemperCounters {
+ fn default() -> Self {
+ Self { allowed_warning_alerts: 4, allowed_renegotiation_requests: 1, allowed_key_update_requests: 32, allowed_middlebox_ccs: 2 }
+ }
+ 
+}
+
+#[derive(Debug, Default)]
+enum KxState {
+ None,
+ Start(&_),
+ Complete(&_),
+}
+
+impl KxState {
+ fn complete(&mut self) {
+ debug_assert!(matches!(self, Self::Start(_)));
+ if let Self::Start(group) = self { *self = Self::Complete(*group); }
+ }
+ 
+}
+
+struct HandshakeFlight<a, const TLS13: bool> {
+ transcript: &mut HandshakeHash,
+ body: Vec<u8>,
+}
+
+impl<a, const TLS13: bool> HandshakeFlight<'a, TLS13> {
+ fn new(transcript: &mut HandshakeHash) -> Self {
+ Self { transcript, body: Vec::new() }
+ }
+ 
+ fn add(&mut self, hs: HandshakeMessagePayload<'_>) {
+ let start_len = self.body.len();
+ hs.encode(&mut self.body);
+ self.transcript.add(&self.body [start_len ..]);
+ }
+ 
+ fn finish(self, common: &mut CommonState) {
+ common.send_msg(Message { version: match TLS13 { true => ProtocolVersion::TLSv1_3, false => ProtocolVersion::TLSv1_2 }, payload: MessagePayload::HandshakeFlight(Payload::new(self.body)) }, TLS13 );
+ }
+ 
+}
+
+type HandshakeFlightTls12<a> = HandshakeFlight<'a, false>;
+
+type HandshakeFlightTls13<a> = HandshakeFlight<'a, true>;
+
+const DEFAULT_RECEIVED_PLAINTEXT_LIMIT: usize = 16 * 1024;
+
+const DEFAULT_BUFFER_LIMIT: usize = 64 * 1024;
+

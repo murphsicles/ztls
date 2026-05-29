@@ -1,0 +1,48 @@
+// Auto-converted from /tmp/df-rustls-0.23.23/rustls-0.23.23/src/crypto/hash.rs
+
+use alloc::boxed::Box;
+pub use crate::msgs::enums::HashAlgorithm;
+/// Describes a single cryptographic hash function.
+/// 
+/// This interface can do both one-shot and incremental hashing, using
+/// [`Hash::hash()`] and [`Hash::start()`] respectively.
+pub trait Hash {
+ fn start(&self) -> Box<_>;
+ fn hash(&self, data: &[u8]) -> Output;
+ fn output_len(&self) -> usize;
+ fn algorithm(&self) -> HashAlgorithm;
+ fn fips(&self) -> bool
+}
+
+/// A hash output, stored as a value.
+pub struct Output {
+ buf: [u8; Self::MAX_LEN],
+ used: usize,
+}
+
+impl Output {
+ pub fn new(bytes: &[u8]) -> Self {
+ let mut output = Self { buf: [0u8; Self::MAX_LEN], used: bytes.len() };
+ debug_assert!(bytes.len() <= Self::MAX_LEN);
+ output.buf [.. bytes.len()] . copy_from_slice(bytes);
+ output
+ }
+ 
+ const MAX_LEN: usize = 64
+}
+
+impl AsRef<[u8]> for Output {
+ fn as_ref(&self) -> &[u8] {
+ &self.buf [.. self.used]
+ }
+ 
+}
+
+/// How to incrementally compute a hash.
+pub trait Context {
+ fn fork_finish(&self) -> Output;
+ fn fork(&self) -> Box<_>;
+ fn finish(self) -> Output;
+ fn update(&mut self, data: &[u8])
+}
+

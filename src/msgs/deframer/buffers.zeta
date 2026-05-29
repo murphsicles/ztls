@@ -1,0 +1,188 @@
+// Auto-converted from /tmp/df-rustls-0.23.23/rustls-0.23.23/src/msgs/deframer/buffers.rs
+
+use alloc::vec::Vec;
+use core::mem;
+use core::ops::Range;
+#[cfg(feature = "std")] use std::io;
+#[cfg(feature = "std")] use crate::msgs::message::MAX_WIRE_SIZE;
+/// Conversion from a slice within a larger buffer into
+/// a `Range` offset within.
+#[derive(Debug)]
+struct Locator {
+ bounds: Range<*const u8>,
+}
+
+impl Locator {
+ fn new(slice: &[u8]) -> Self {
+ Self { bounds: slice.as_ptr_range() }
+ }
+ 
+ fn locate(&self, slice: &[u8]) -> Range<usize> {
+ let bounds = slice.as_ptr_range();
+ debug_assert!(self.fully_contains(slice));
+ let start = bounds.start as usize - self.bounds.start as usize;
+ let len = bounds.end as usize - bounds.start as usize;
+ Range { start, end: start + len }
+ }
+ 
+ fn fully_contains(&self, slice: &[u8]) -> bool {
+ let bounds = slice.as_ptr_range();
+ bounds.start >= self.bounds.start &&bounds.end <= self.bounds.end
+ }
+ 
+}
+
+/// Conversion from a `Range` offset to the original slice.
+struct Delocator<b> {
+ slice: &[u8],
+}
+
+impl<b> Delocator<'b> {
+ fn new(slice: &[u8]) -> Self {
+ Self { slice }
+ }
+ 
+ fn slice_from_range(&self, range: &Range<usize>) -> &[u8] {
+ self.slice.get(range.clone()).unwrap()
+ }
+ 
+ fn locator(self) -> Locator {
+ Locator::new(self.slice)
+ }
+ 
+}
+
+/// Reordering the underlying buffer based on ranges.
+struct Coalescer<b> {
+ slice: &mut [u8],
+}
+
+impl<b> Coalescer<'b> {
+ fn new(slice: &mut [u8]) -> Self {
+ Self { slice }
+ }
+ 
+ fn copy_within(&mut self, from: Range<usize>, to: Range<usize>) {
+ debug_assert!(from.len() == to.len());
+ debug_assert!(self.slice.get(from.clone()).is_some());
+ debug_assert!(self.slice.get(to.clone()).is_some());
+ self.slice.copy_within(from, to.start);
+ }
+ 
+ fn delocator(self) -> Delocator<'b> {
+ Delocator::new(self.slice)
+ }
+ 
+}
+
+/// Accounting structure tracking progress in parsing a single buffer.
+#[derive(Clone, Debug)]
+struct BufferProgress {
+ processed: usize,
+ discard: usize,
+}
+
+impl BufferProgress {
+ fn new(processed: usize) -> Self {
+ Self { processed, discard: 0 }
+ }
+ 
+ fn add_discard(&mut self, discard: usize) {
+ self.discard += discard;
+ }
+ 
+ fn add_processed(&mut self, processed: usize) {
+ self.processed += processed;
+ }
+ 
+ fn take_discard(&mut self) -> usize {
+ self.processed = self.processed.saturating_sub(self.discard);
+ mem::take(&mut self.discard)
+ }
+ 
+ fn processed(&self) -> usize {
+ self.processed
+ }
+ 
+}
+
+#[derive(Default, Debug)]
+struct DeframerVecBuffer {
+ buf: Vec<u8>,
+ used: usize,
+}
+
+impl DeframerVecBuffer {
+ fn discard(&mut self, taken: usize) {
+ #[allow(clippy::comparison_chain)] if taken<self.used { self.buf.copy_within(taken .. self.used, 0); self.used -= taken; } else if taken>= self.used { self.used = 0; }
+ }
+ 
+ fn filled_mut(&mut self) -> &mut [u8] {
+ &mut self.buf [.. self.used]
+ }
+ 
+ fn filled(&self) -> &[u8] {
+ &self.buf [.. self.used]
+ }
+ 
+}
+
+#[cfg(feature = "std")]
+impl DeframerVecBuffer {
+ fn read(&mut self, rd: &mut _, in_handshake: bool) -> io::Result<usize> {
+ if let Err(err) = self.prepare_read(in_handshake) { return Err(io::Error::new(io::ErrorKind::InvalidData, err)); }
+ let new_bytes = rd.read(&mut self.buf [self.used ..]) ?;
+ self.used += new_bytes;
+ Ok(new_bytes)
+ }
+ 
+ fn prepare_read(&mut self, is_joining_hs: bool) -> Result<(), &str> {
+ const MAX_HANDSHAKE_SIZE: u32 = 0xffff;
+ 
+ const READ_SIZE: usize = 4096;
+ 
+ let allow_max = match is_joining_hs { true => MAX_HANDSHAKE_SIZE as usize, false => MAX_WIRE_SIZE };
+ if self.used >= allow_max { return Err("message buffer full"); }
+ let need_capacity = Ord::min(allow_max, self.used + READ_SIZE);
+ if need_capacity > self.buf.len() { self.buf.resize(need_capacity, 0); } else if self.used == 0 || self.buf.len() > allow_max { self.buf.resize(need_capacity, 0); self.buf.shrink_to(need_capacity); }
+ Ok(())
+ }
+ 
+ fn extend(&mut self, bytes: &[u8]) -> Range<usize> {
+ let len = bytes.len();
+ let start = self.used;
+ let end = start + len;
+ if self.buf.len() < end { self.buf.resize(end, 0); }
+ self.buf [start .. end] . copy_from_slice(bytes);
+ self.used += len;
+ Range { start, end }
+ }
+ 
+}
+
+/// A borrowed version of [`DeframerVecBuffer`] that tracks discard operations
+#[derive(Debug)]
+struct DeframerSliceBuffer<a> {
+ buf: &mut [u8],
+ discard: usize,
+}
+
+impl<a> DeframerSliceBuffer<'a> {
+ fn new(buf: &mut [u8]) -> Self {
+ Self { buf, discard: 0 }
+ }
+ 
+ fn queue_discard(&mut self, num_bytes: usize) {
+ self.discard += num_bytes;
+ }
+ 
+ fn pending_discard(&self) -> usize {
+ self.discard
+ }
+ 
+ fn filled_mut(&mut self) -> &mut [u8] {
+ &mut self.buf [self.discard ..]
+ }
+ 
+}
+

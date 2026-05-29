@@ -1,0 +1,54 @@
+// Auto-converted from /tmp/df-rustls-0.23.23/rustls-0.23.23/src/crypto/hmac.rs
+
+use alloc::boxed::Box;
+use zeroize::Zeroize;
+/// A concrete HMAC implementation, for a single cryptographic hash function.
+/// 
+/// You should have one object that implements this trait for HMAC-SHA256, another
+/// for HMAC-SHA384, etc.
+pub trait Hmac {
+ fn with_key(&self, key: &[u8]) -> Box<_>;
+ fn hash_output_len(&self) -> usize;
+ fn fips(&self) -> bool
+}
+
+/// A HMAC tag, stored as a value.
+#[derive(Clone)]
+pub struct Tag {
+ buf: [u8; Self::MAX_LEN],
+ used: usize,
+}
+
+impl Tag {
+ pub fn new(bytes: &[u8]) -> Self {
+ let mut tag = Self { buf: [0u8; Self::MAX_LEN], used: bytes.len() };
+ tag.buf [.. bytes.len()] . copy_from_slice(bytes);
+ tag
+ }
+ 
+ const MAX_LEN: usize = 64
+}
+
+impl Drop for Tag {
+ fn drop(&mut self) {
+ self.buf.zeroize();
+ }
+ 
+}
+
+impl AsRef<[u8]> for Tag {
+ fn as_ref(&self) -> &[u8] {
+ &self.buf [.. self.used]
+ }
+ 
+}
+
+/// A HMAC key that is ready for use.
+/// 
+/// The algorithm used is implicit in the `Hmac` object that produced the key.
+pub trait Key {
+ fn sign(&self, data: &[&[u8]]) -> Tag;
+ fn sign_concat(&self, first: &[u8], middle: &[&[u8]], last: &[u8]) -> Tag;
+ fn tag_len(&self) -> usize
+}
+
