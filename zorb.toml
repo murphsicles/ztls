@@ -1,9 +1,9 @@
 [package]
-name = "@crypto/ztls"
+name = "@tls/ztls"
 version = "1.0.0"
-description = "Zeta port of rustls v0.23.23"
+description = "Pure Zeta TLS implementation — transpiled from rustls v0.23.23"
 authors = ["The Zeta Foundation"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/murphsicles/ztls"
-keywords = ["crypto", "zeta", "rustls"]
-categories = ["crypto"]
+keywords = ["tls", "ssl", "crypto", "zeta"]
+categories = ["security", "networking"]
